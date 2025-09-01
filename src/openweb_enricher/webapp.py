@@ -10,22 +10,19 @@ import threading
 import time
 import uuid
 from datetime import datetime
-from contextlib import redirect_stdout
 from collections import deque
-import sys
 
 from openweb_enricher.main import run_enrich_on_df
+from openweb_enricher.config import JOBS_DIR, BASIC_AUTH_USER, BASIC_AUTH_PASS, MAX_QUERIES, MAX_EMAILS
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50 MB uploads
 
-# In-memory stores (simple)
-_jobs = {}  # job_id -> {"status": "running|done|error", "started": ts, "finished": ts or None}
-_logs = {}  # job_id -> deque of log-chunks
-_results = {}  # job_id -> result dict returned by run_enrich_on_df
-_history = deque(maxlen=50)  # recent job summaries
+_jobs = {}
+_logs = {}
+_results = {}
+_history = deque(maxlen=50)
 
-# Templates (simple, centered, responsive)
 BASE_CSS = """
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:#f6f8fa; color:#111; }
@@ -35,29 +32,36 @@ BASE_CSS = """
   .upload { display:flex; gap:8px; justify-content:center; align-items:center; margin:18px 0; }
   .btn { background:#0b6cff; color:white; padding:8px 12px; border-radius:6px; text-decoration:none; border:none; cursor:pointer; }
   .btn.secondary { background:#e6eefc; color:#0b6cff; }
-  pre.log { background:#0f1720; color:#d6f0ff; padding:12px; border-radius:6px; height:280px; overflow:auto; white-space:pre-wrap; }
+  pre.log { background:#0f1720; color:#d6f0ff; padding:12px; border-radius:6px; height:300px; overflow:auto; white-space:pre-wrap; }
   table { width:100%; border-collapse:collapse; margin-top:12px; }
   th, td { border:1px solid #eee; padding:6px 8px; font-size:0.9rem; }
   .meta { display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap; }
   .history { margin-top:18px; }
   a.link { color:#0b6cff; text-decoration:none; }
   .small { font-size:0.9rem; color:#555; }
+  input[type=number] { padding:4px; border-radius:4px; border:1px solid #ddd; }
 </style>
 """
 
-INDEX_HTML = BASE_CSS + """
+INDEX_HTML_TEMPLATE = BASE_CSS + """
 <div class="wrap center">
   <h1>OpenWeb Enricher — Upload & Run</h1>
-  <p class="small">Upload an Excel (.xlsx) with Owner columns. The job will run and show live logs below.</p>
+  <p class="small">Upload an Excel (.xlsx) with Owner columns. Configure run below.</p>
 
   <form action="/upload" method="post" enctype="multipart/form-data" class="upload">
     <input type="file" name="file" accept=".xlsx" required>
-    <!-- added scrape checkbox so users can enable page scraping -->
     <label style="display:flex;align-items:center;gap:8px;margin-left:8px">
       <input type="checkbox" name="scrape" checked> Fetch & scrape result pages
     </label>
     <button class="btn" type="submit">Upload & Run</button>
   </form>
+
+  <div style="display:flex;justify-content:center;gap:10px;margin-top:8px;">
+    <label class="small">Results per query: <input type="number" name="results_per_query" value="10" min="1" max="50" form="configForm" style="width:80px"></label>
+    <label class="small">Max queries: <input type="number" name="max_queries" value="__MAX_QUERIES__" min="1" max="10" form="configForm" style="width:80px"></label>
+    <label class="small">Max emails: <input type="number" name="max_emails" value="__MAX_EMAILS__" min="1" max="5" form="configForm" style="width:80px"></label>
+    <label class="small">Fetch timeout (s): <input type="number" name="fetch_timeout" value="15" min="1" max="60" form="configForm" style="width:80px"></label>
+  </div>
 
   <div class="history">
     <h3>Recent runs</h3>
@@ -84,6 +88,8 @@ INDEX_HTML = BASE_CSS + """
   </div>
 </div>
 """
+# safely substitute numeric defaults without touching Jinja braces
+INDEX_HTML = INDEX_HTML_TEMPLATE.replace("__MAX_QUERIES__", str(MAX_QUERIES)).replace("__MAX_EMAILS__", str(MAX_EMAILS))
 
 VIEW_HTML = BASE_CSS + """
 <div class="wrap">
@@ -129,22 +135,17 @@ VIEW_HTML = BASE_CSS + """
     if (e.data === '__KEEPALIVE__') return;
     if (e.data === '__COMPLETE__') {
       evtSource.close();
-      // auto-reload to show fresh results saved on the server
       window.location.reload();
       return;
     }
-    // append line
     logEl.textContent += e.data + "\\n";
     logEl.scrollTop = logEl.scrollHeight;
   };
-  evtSource.onerror = function() {
-    // leave the connection to retry automatically
-  };
+  evtSource.onerror = function() {};
 })();
 </script>
 """
 
-# Utilities
 def _new_job():
     job_id = uuid.uuid4().hex[:12]
     _jobs[job_id] = {"status": "running", "started": datetime.utcnow().isoformat(), "finished": None}
@@ -152,7 +153,6 @@ def _new_job():
     return job_id
 
 def _append_log(job_id, text):
-    # split text into reasonable chunks
     if not text:
         return
     for part in text.splitlines():
@@ -162,7 +162,6 @@ def _finish_job(job_id, result):
     _jobs[job_id]["status"] = "done"
     _jobs[job_id]["finished"] = datetime.utcnow().isoformat()
     _results[job_id] = result
-    # record history entry
     summary = {
         "job_id": job_id,
         "started": _jobs[job_id]["started"],
@@ -187,9 +186,7 @@ def _error_job(job_id, err_text):
     }
     _history.appendleft(summary)
 
-# Worker runner that captures stdout and streams it into _logs
-def _run_job_thread(job_id, df, scrape_flag, job_dir):
-    """Run enrichment while streaming stdout into _logs and persisting job files."""
+def _run_job_thread(job_id, df, scrape_flag, job_dir, max_queries, max_emails, results_per_query, fetch_timeout):
     import sys, json, traceback
     class StreamToLogs:
         def __init__(self, job_id):
@@ -213,15 +210,17 @@ def _run_job_thread(job_id, df, scrape_flag, job_dir):
     sys.stdout = writer
 
     try:
-        # run the enrichment (prints go to writer -> _append_log)
-        result = run_enrich_on_df(df, scrape_pages=scrape_flag)
+        result = run_enrich_on_df(
+            df,
+            scrape_pages=scrape_flag,
+            max_queries=max_queries,
+            max_emails=max_emails,
+            results_per_query=results_per_query,
+            fetch_timeout=fetch_timeout
+        )
         writer.flush()
-
-        # persist result JSON
         with open(os.path.join(job_dir, "result.json"), "w") as fjson:
-            json.dump(result, fjson, indent=2)
-
-        # persist outputs
+            json.dump({"result": result, "config": result.get("config", {})}, fjson, indent=2)
         df_out = pd.DataFrame(result.get("rows", []))
         xlsx_path = os.path.join(job_dir, f"results_{job_id}.xlsx")
         csv_path = os.path.join(job_dir, f"results_{job_id}.csv")
@@ -230,15 +229,11 @@ def _run_job_thread(job_id, df, scrape_flag, job_dir):
         except Exception:
             pass
         df_out.to_csv(csv_path, index=False)
-
-        # persist logs: drain current in-memory lines to file
         log_path = os.path.join(job_dir, "run.log")
         with open(log_path, "w") as flog:
             while _logs[job_id]:
                 flog.write(_logs[job_id].popleft() + "\n")
-
         _finish_job(job_id, result)
-
     except Exception as e:
         tb = traceback.format_exc()
         _append_log(job_id, tb)
@@ -251,7 +246,6 @@ def _run_job_thread(job_id, df, scrape_flag, job_dir):
 
 @app.route("/", methods=["GET"])
 def index():
-    # prepare a history list for the template
     return render_template_string(INDEX_HTML, history=list(_history))
 
 @app.route("/upload", methods=["POST"])
@@ -260,7 +254,23 @@ def upload():
     if not f:
         return "No file uploaded", 400
     scrape_flag = request.form.get("scrape") == "on"
-    # save to a temp file and read with pandas
+    try:
+        results_per_query = int(request.form.get("results_per_query") or 10)
+    except Exception:
+        results_per_query = 10
+    try:
+        max_queries = int(request.form.get("max_queries") or MAX_QUERIES)
+    except Exception:
+        max_queries = MAX_QUERIES
+    try:
+        max_emails = int(request.form.get("max_emails") or MAX_EMAILS)
+    except Exception:
+        max_emails = MAX_EMAILS
+    try:
+        fetch_timeout = float(request.form.get("fetch_timeout") or 15.0)
+    except Exception:
+        fetch_timeout = 15.0
+
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         tmp_path = tmp.name
         f.save(tmp_path)
@@ -272,10 +282,14 @@ def upload():
     os.unlink(tmp_path)
 
     job_id = _new_job()
-    job_dir = os.path.join("data", "jobs", job_id)
+    job_dir = os.path.join(JOBS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    thread = threading.Thread(target=_run_job_thread, args=(job_id, df, scrape_flag, job_dir), daemon=True)
+    thread = threading.Thread(
+        target=_run_job_thread,
+        args=(job_id, df, scrape_flag, job_dir, max_queries, max_emails, results_per_query, fetch_timeout),
+        daemon=True
+    )
     thread.start()
     return redirect(url_for('view', job_id=job_id))
 
@@ -297,47 +311,43 @@ def view(job_id):
 def stream(job_id):
     if job_id not in _jobs:
         return "Unknown job", 404
-
     def gen():
-        # Stream log lines as server-sent events
-        # Keep sending keepalive to prevent connection close
-        sent = 0
         while True:
-            # send any pending log lines
             while _logs[job_id]:
                 line = _logs[job_id].popleft()
-                # escape newlines; SSE expects one event per message
                 yield f"data: {line}\n\n"
-                sent += 1
             status = _jobs[job_id]["status"]
             if status in ("done", "error") and not _logs[job_id]:
-                # final marker
                 yield "data: __COMPLETE__\n\n"
                 break
-            # keepalive
             yield "data: __KEEPALIVE__\n\n"
             time.sleep(0.8)
-
     return Response(stream_with_context(gen()), mimetype="text/event-stream")
 
 @app.route("/download/<job_id>/<fmt>")
 def download(job_id, fmt):
     res = _results.get(job_id)
+    job_dir = os.path.join(JOBS_DIR, job_id)
+    if fmt == "xlsx":
+        xlsx_path = os.path.join(job_dir, f"results_{job_id}.xlsx")
+        if os.path.exists(xlsx_path):
+            return send_file(xlsx_path, as_attachment=True)
+    if fmt == "csv":
+        csv_path = os.path.join(job_dir, f"results_{job_id}.csv")
+        if os.path.exists(csv_path):
+            return send_file(csv_path, as_attachment=True)
     if not res:
         return "No results for job", 404
     df = pd.DataFrame(res["rows"])
     bio = io.BytesIO()
     if fmt == "xlsx":
-        df.to_excel(bio, index=False)
-        bio.seek(0)
+        df.to_excel(bio, index=False); bio.seek(0)
         return send_file(bio, download_name=f"enriched_{job_id}.xlsx", as_attachment=True)
     elif fmt == "csv":
-        df.to_csv(bio, index=False)
-        bio.seek(0)
+        df.to_csv(bio, index=False); bio.seek(0)
         return send_file(bio, download_name=f"enriched_{job_id}.csv", as_attachment=True)
-    # run local dev server
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    else:
+        return "Unsupported format", 400
 
 if __name__ == "__main__":
-    # run local dev server
     app.run(host="127.0.0.1", port=5000, debug=True)
