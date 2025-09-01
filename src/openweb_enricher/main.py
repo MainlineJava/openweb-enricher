@@ -4,6 +4,7 @@ import re
 import time
 import requests
 import pandas as pd
+import io
 from openweb_enricher.config import (
     BRAVE_API_KEY, INPUT_FILE, OUTPUT_FILE, CHECKPOINT_FILE,
     MAX_QUERIES, MAX_EMAILS, GENERIC_PREFIXES
@@ -277,6 +278,99 @@ def enrich():
             print(f"⚠️ Excel write failed ({e}), saved CSV to {csv_path}")
     else:
         print("❌ No new results found. (output_rows is empty)")
+
+def run_enrich_on_df(df, scrape_pages=True):
+    """
+    Run enrichment on a pandas DataFrame and return dict with metadata + rows.
+    scrape_pages: if False, skip fetching full pages (only use snippets from Brave results).
+    """
+    # normalize small quirks in column names (strip)
+    df = df.copy()
+    df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+    df_cols = list(df.columns)
+
+    processed = set()
+    output_rows = []
+    total_records = 0
+    total_emails_found = 0
+
+    for idx, row in df.iterrows():
+        total_records += 1
+        record_id = row.get("ID")
+        if pd.isna(record_id):
+            record_id = f"row-{idx}"
+        if str(record_id) in processed:
+            continue
+
+        # skip if Is corp? column exists and is true
+        is_corp_val = _col_value(row, df_cols, "Is corp?")
+        if _is_true(is_corp_val):
+            processed.add(str(record_id))
+            continue
+
+        # collect owners from possible owner columns, split multiple names
+        owners = []
+        for desired in ("Owner 1", "Owner 2"):
+            raw = _col_value(row, df_cols, desired)
+            if isinstance(raw, str) and raw.strip():
+                parts = re.split(r'[&/;,]+', raw)
+                owners.extend([p.strip() for p in parts if p.strip()])
+
+        if not owners:
+            processed.add(str(record_id))
+            continue
+
+        for name in owners:
+            if "trust" in str(name).lower():
+                continue
+
+            emails_collected = []
+            seen_urls = set()
+
+            for attempt in range(MAX_QUERIES):
+                results = brave_search(name)
+                for result in results:
+                    url = result.get("url", "")
+                    snippet = result.get("description", "") or result.get("snippet", "") or ""
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    combined = f"{result.get('title', '')} {snippet} {url}"
+                    emails = extract_emails(combined)
+
+                    # attempt deeper page scrape only if enabled
+                    if scrape_pages and len(emails_collected) < MAX_EMAILS:
+                        page_text = fetch_and_scrape(url)
+                        if page_text:
+                            page_emails = extract_emails(page_text)
+                            new_page_emails = [e for e in page_emails if e not in emails and e not in emails_collected]
+                            if new_page_emails:
+                                emails = emails + new_page_emails
+
+                    for email in emails:
+                        if email not in emails_collected and len(emails_collected) < MAX_EMAILS:
+                            output_rows.append({
+                                "input_id": record_id,
+                                "name": name,
+                                "email": email,
+                                "confidence": 1.0,
+                                "source": url,
+                                "snippet": snippet
+                            })
+                            emails_collected.append(email)
+                            total_emails_found += 1
+                if len(emails_collected) >= MAX_EMAILS:
+                    break
+                time.sleep(0.3)
+
+        processed.add(str(record_id))
+
+    # return a tuple with metadata + rows
+    return {
+        "total_records": total_records,
+        "total_emails_found": total_emails_found,
+        "rows": output_rows
+    }
 
 if __name__ == "__main__":
     enrich()
