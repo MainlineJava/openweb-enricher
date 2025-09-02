@@ -183,6 +183,7 @@ def enrich():
                     emails = extract_emails(combined)
                     if emails:
                         for e in emails:
+                            print(f"EMAIL FOUND: {e}")  # <-- highlight email found immediately
                             print(f"    found email (snippet): {e}")
                     else:
                         print("    no emails found in this result")
@@ -193,6 +194,7 @@ def enrich():
                             new_page_emails = [e for e in page_emails if e not in emails and e not in emails_collected]
                             if new_page_emails:
                                 for e in new_page_emails:
+                                    print(f"EMAIL FOUND: {e}")  # <-- highlight email found immediately
                                     print(f"    found on page: {e}")
                                 emails = emails + new_page_emails
                             else:
@@ -202,6 +204,7 @@ def enrich():
                                     print("    no emails found on the fetched page")
                     for email in emails:
                         if email not in emails_collected and len(emails_collected) < MAX_EMAILS:
+                            print(f"EMAIL FOUND: {email}")  # <-- highlight email found immediately
                             output_rows.append({
                                 "input_id": record_id,
                                 "name": name,
